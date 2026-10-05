@@ -1503,7 +1503,7 @@ pub fn print(self: *Terminal, c: u21) !void {
     // non-single-width characters properly. We have a fast-path for
     // byte-sized characters since they're so common. We can ignore
     // control characters because they're always filtered prior.
-    const width: usize = if (c <= 0xFF) 1 else @intCast(unicode.table.get(c).width);
+    const width: usize = if (c <= 0xFF or self.printsAsSpace()) 1 else @intCast(unicode.table.get(c).width);
 
     // Note: it is possible to have a width of "3" and a width of "-1" from
     // uucode.x's wcwidth. We should look into those cases and handle them
@@ -1634,6 +1634,16 @@ pub fn print(self: *Terminal, c: u21) !void {
 
     // Move the cursor
     self.screens.active.cursorRight(1);
+}
+
+/// Whether a codepoint above 0xFF prints as a space: a charset other than
+/// UTF-8 or ASCII is active for it (see printCell), and its table has no
+/// such codepoint. The space is one column wide, whatever the codepoint's
+/// own width, or the cell would be a wide space that no output reproduces.
+fn printsAsSpace(self: *const Terminal) bool {
+    const charset = &self.screens.active.charset;
+    const set = charset.charsets.get(charset.single_shift orelse charset.gl);
+    return set != .utf8 and set != .ascii;
 }
 
 fn printCell(
@@ -6980,6 +6990,27 @@ test "Terminal: print charset outside of ASCII" {
     }
 
     try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+}
+
+test "Terminal: print wide codepoint in a charset prints a narrow space" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 2 });
+    defer t.deinit(testing.allocator);
+
+    // The charset has no such codepoint, so it prints as a space, which
+    // takes one column like any other space, not the two the emoji would.
+    t.configureCharset(.G0, .dec_special);
+    try t.print('`');
+    try t.print(0x1F600);
+    try t.print('a');
+    try testing.expectEqual(@as(usize, 3), t.screens.active.cursor.x);
+    const cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 1, .y = 0 } }).?.cell;
+    try testing.expectEqual(@as(u21, ' '), cell.codepoint());
+    try testing.expectEqual(.narrow, cell.wide);
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("◆ ▒", str);
+    }
 }
 
 test "Terminal: print invoke charset" {
