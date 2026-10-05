@@ -91,9 +91,10 @@ pub const Options = struct {
     unwrap: bool = false,
 
     /// Trim trailing whitespace on lines with other text. Trailing blank
-    /// lines are always trimmed. This only affects trailing whitespace
-    /// on rows that have at least one other cell with text. Whitespace
-    /// is currently only space characters (0x20).
+    /// lines are always trimmed, except in VT output with trim disabled,
+    /// where they are part of the screen's layout. This only affects
+    /// trailing whitespace on rows that have at least one other cell with
+    /// text. Whitespace is currently only space characters (0x20).
     trim: bool = true,
 
     /// Replace matching Unicode codepoints with some other values.
@@ -410,16 +411,46 @@ pub const TerminalFormatter = struct {
         // simplicity we just emit them all before. If we make this more complex
         // later we should add test cases for it.
         if (self.opts.emit == .vt and self.extra.modes) {
-            inline for (@typeInfo(modespkg.Mode).@"enum".fields) |field| {
-                const mode: modespkg.Mode = @enumFromInt(field.value);
-                const current = self.terminal.modes.get(mode);
-                const default_val = @field(self.terminal.modes.default, field.name);
+            // The alternate screen modes come first: entering the alternate
+            // screen can save the cursor (1049, origin mode included) and
+            // clear the screen, so the other modes are set after it.
+            inline for (.{ true, false }) |alt_pass| {
+                inline for (@typeInfo(modespkg.Mode).@"enum".fields) |field| {
+                    const mode: modespkg.Mode = @enumFromInt(field.value);
+                    const alt = comptime switch (mode) {
+                        .alt_screen_legacy, .alt_screen, .alt_screen_save_cursor_clear_enter => true,
+                        else => false,
+                    };
+                    const current = self.terminal.modes.get(mode);
+                    const default_val = @field(self.terminal.modes.default, field.name);
 
-                if (current != default_val) {
-                    const tag: modespkg.ModeTag = @bitCast(@intFromEnum(mode));
-                    const prefix = if (tag.ansi) "" else "?";
-                    const suffix = if (current) "h" else "l";
-                    try writer.print("\x1b[{s}{d}{s}", .{ prefix, tag.value, suffix });
+                    // Autowrap off and insert mode are set after the
+                    // screen contents, which rely on autowrap to restore
+                    // soft-wrapped rows and on replacing cells, not
+                    // inserting them.
+                    const after_contents = (mode == .wraparound and !current) or (mode == .insert and current);
+                    if (alt == alt_pass and current != default_val and !after_contents) {
+                        const tag: modespkg.ModeTag = @bitCast(@intFromEnum(mode));
+                        const prefix = if (tag.ansi) "" else "?";
+                        const suffix = if (current) "h" else "l";
+                        try writer.print("\x1b[{s}{d}{s}", .{ prefix, tag.value, suffix });
+                    }
+                }
+
+                // Leaving the alternate screen with one mode keeps the
+                // others set, so the primary screen can be active with
+                // an alternate screen mode set. Leave again with a mode
+                // that is not set, which changes no mode.
+                if (alt_pass and self.terminal.screens.active_key == .primary) {
+                    if (!self.terminal.modes.get(.alt_screen_legacy)) {
+                        if (self.terminal.modes.get(.alt_screen) or
+                            self.terminal.modes.get(.alt_screen_save_cursor_clear_enter))
+                            try writer.writeAll("\x1b[?47l");
+                    } else if (!self.terminal.modes.get(.alt_screen)) {
+                        try writer.writeAll("\x1b[?1047l");
+                    } else {
+                        try writer.writeAll("\x1b[?1049l");
+                    }
                 }
             }
 
@@ -488,6 +519,46 @@ pub const TerminalFormatter = struct {
         screen_formatter.pin_map = self.pin_map;
         try screen_formatter.format(writer);
 
+        // Autowrap off and insert mode, held back from the modes above.
+        if (self.opts.emit == .vt and self.extra.modes) {
+            var buf: [16]u8 = undefined;
+            var held_writer: std.Io.Writer = .fixed(&buf);
+            if (!self.terminal.modes.get(.wraparound)) held_writer.writeAll("\x1b[?7l") catch unreachable;
+            if (self.terminal.modes.get(.insert)) held_writer.writeAll("\x1b[4h") catch unreachable;
+            const held = held_writer.buffered();
+            if (held.len > 0) {
+                try writer.writeAll(held);
+                if (self.pin_map) |*m| m.map.append(
+                    m.alloc,
+                    m.map.getLastOrNull() orelse
+                        self.terminal.screens.active.pages.getTopLeft(.screen),
+                    held.len,
+                ) catch return error.WriteFailed;
+            }
+        }
+
+        // The cursor saved by DECSC (or mode 1048) is part of the cursor
+        // state: recreate it and save it. This comes before the scrolling
+        // region is restored, while the margins are the whole screen and a
+        // CUP is absolute even in origin mode.
+        if (self.opts.emit == .vt and self.extra.screen.cursor) {
+            if (self.terminal.screens.active.saved_cursor) |saved| {
+                try self.writeSavedCursor(writer, &screen_formatter, saved);
+
+                // If we have a pin_map, map these bytes to the last pin.
+                if (self.pin_map) |*m| {
+                    var discarding: std.Io.Writer.Discarding = .init(&.{});
+                    try self.writeSavedCursor(&discarding.writer, &screen_formatter, saved);
+                    m.map.append(
+                        m.alloc,
+                        m.map.getLastOrNull() orelse
+                            self.terminal.screens.active.pages.getTopLeft(.screen),
+                        std.math.cast(usize, discarding.count) orelse return error.WriteFailed,
+                    ) catch return error.WriteFailed;
+                }
+            }
+        }
+
         // Extra terminal state to emit after the screen contents so that
         // it doesn't impact the emitted contents.
         if (self.opts.emit == .vt) {
@@ -548,7 +619,102 @@ pub const TerminalFormatter = struct {
         // cursor last.
         screen_formatter.content = .none;
         screen_formatter.extra = self.extra.screen;
+
+        // With origin mode set, which the modes above restored, CUP counts
+        // from the top-left of the margins.
+        if (self.terminal.modes.get(.origin)) screen_formatter.cursor_origin = .{
+            .x = self.terminal.scrolling_region.left,
+            .y = self.terminal.scrolling_region.top,
+        };
+
         try screen_formatter.format(writer);
+    }
+
+    /// Recreates a saved cursor: puts its position, pen, protection,
+    /// charsets and origin mode in place and saves them with DECSC, then
+    /// resets what it changed, so the current cursor state written after it
+    /// starts from the defaults it expects.
+    fn writeSavedCursor(
+        self: TerminalFormatter,
+        writer: *std.Io.Writer,
+        screen_formatter: *const ScreenFormatter,
+        saved: Screen.SavedCursor,
+    ) std.Io.Writer.Error!void {
+        const screen = self.terminal.screens.active;
+        const origin = self.terminal.modes.get(.origin);
+
+        // DECSC saves origin mode too. Set it as it was saved first, since
+        // setting it moves the cursor home; the margins are the whole
+        // screen here, so the position that follows is absolute either way.
+        if (saved.origin != origin) try writer.writeAll(if (saved.origin) "\x1b[?6h" else "\x1b[?6l");
+        var absolute = screen_formatter.*;
+        absolute.cursor_origin = .{};
+        const x = @min(saved.x, self.terminal.cols - 1);
+        const y = @min(saved.y, self.terminal.rows - 1);
+        const pin = screen.pages.pin(.{ .active = .{ .x = x, .y = y } }) orelse return;
+
+        // A wrap pending before the last column was pending at a right
+        // margin, which is not set yet (the margins come after this); set
+        // one there for the reprint. The left margin stays at the edge,
+        // so the position is still absolute.
+        const margin = saved.pending_wrap and x != self.terminal.cols - 1 and
+            self.terminal.modes.get(.enable_left_and_right_margin);
+        if (margin) try writer.print("\x1b[1;{d}s", .{x + 1});
+        try absolute.writeCursorPosition(writer, pin, x, y, saved.pending_wrap);
+
+        try writer.print("{f}", .{saved.style.formatterVt()});
+        if (saved.protected) try writer.writeAll("\x1b[1\"q");
+        try ScreenFormatter.writeCharsets(writer, &saved.charset);
+
+        try writer.writeAll("\x1b7");
+        if (margin) try writer.writeAll("\x1b[s");
+
+        // Put back what the current cursor state written after this does
+        // not set itself: the default pen and protection (it sets them only
+        // when they are not the defaults), the charsets the saved ones
+        // replaced, and origin mode.
+        try writer.writeAll("\x1b[0m");
+        if (saved.protected) try writer.writeAll("\x1b[0\"q");
+        try writeCharsetChanges(writer, &saved.charset, &screen.charset);
+        if (saved.origin != origin) try writer.writeAll(if (origin) "\x1b[?6h" else "\x1b[?6l");
+    }
+
+    /// Writes what turns charset state from into to. No sequence designates
+    /// the default UTF-8 charset, so a slot that is UTF-8 in to is designated
+    /// ASCII, which prints the same.
+    fn writeCharsetChanges(
+        writer: *std.Io.Writer,
+        from: *const Screen.CharsetState,
+        to: *const Screen.CharsetState,
+    ) std.Io.Writer.Error!void {
+        for (std.enums.values(charsets.Slots)) |slot| {
+            const want = to.charsets.get(slot);
+            if (from.charsets.get(slot) == want) continue;
+            const intermediate: u8 = switch (slot) {
+                .G0 => '(',
+                .G1 => ')',
+                .G2 => '*',
+                .G3 => '+',
+            };
+            const final: u8 = switch (want) {
+                .utf8, .ascii => 'B',
+                .british => 'A',
+                .dec_special => '0',
+            };
+            try writer.print("\x1b{c}{c}", .{ intermediate, final });
+        }
+        if (from.gl != to.gl) try writer.writeAll(switch (to.gl) {
+            .G0 => "\x0f", // SI - Shift In
+            .G1 => "\x0e", // SO - Shift Out
+            .G2 => "\x1bn", // LS2
+            .G3 => "\x1bo", // LS3
+        });
+        if (from.gr != to.gr) try writer.writeAll(switch (to.gr) {
+            .G0 => "",
+            .G1 => "\x1b~", // LS1R
+            .G2 => "\x1b}", // LS2R
+            .G3 => "\x1b|", // LS3R
+        });
     }
 };
 
@@ -578,6 +744,17 @@ pub const ScreenFormatter = struct {
     ///
     /// Warning: there is a significant performance hit to track this
     pin_map: ?PinMap,
+
+    /// Where cursor positions are counted from when the cursor extra is
+    /// emitted: the top-left of the margins when origin mode (DECOM) is set,
+    /// since CUP is relative to them then. The screen does not know the
+    /// terminal's modes, so TerminalFormatter sets this.
+    cursor_origin: CursorOrigin,
+
+    pub const CursorOrigin = struct {
+        x: size.CellCountInt = 0,
+        y: size.CellCountInt = 0,
+    };
 
     pub const Content = union(enum) {
         /// Emit no content, only terminal state such as modes, palette, etc.
@@ -660,6 +837,7 @@ pub const ScreenFormatter = struct {
             .content = .{ .selection = null },
             .extra = .none,
             .pin_map = null,
+            .cursor_origin = .{},
         };
     }
 
@@ -699,37 +877,15 @@ pub const ScreenFormatter = struct {
         // pending wrap requires reprinting the cell at the right edge. That
         // print uses and changes active screen state, so the requested style,
         // hyperlink, protection, and charset must be restored afterwards.
-        if (self.extra.cursor) cursor: {
+        if (self.extra.cursor) {
             const cursor = &self.screen.cursor;
-
-            // If we don't have pending wrap, then we can just use CUP.
-            if (!cursor.pending_wrap or cursor.x != self.screen.pages.cols - 1) {
-                try writer.print("\x1b[{d};{d}H", .{ cursor.y + 1, cursor.x + 1 });
-                break :cursor;
-            }
-
-            // Pending wrap, we can't use CUP because it resets pending wrap.
-            const start_x = switch (cursor.page_cell.wide) {
-                .spacer_tail => cursor.x - 1,
-                .narrow, .wide, .spacer_head => cursor.x,
-            };
-
-            // Move cursor to the edge.
-            try writer.print(
-                "\x1b[{d};{d}H",
-                .{ cursor.y + 1, start_x + 1 },
+            try self.writeCursorPosition(
+                writer,
+                cursor.page_pin.*,
+                cursor.x,
+                cursor.y,
+                cursor.pending_wrap,
             );
-
-            // Reformat the cell which sets the proper pending wrap state.
-            var cell_formatter: PageFormatter = .init(
-                cursor.page_pin.node.page(),
-                self.opts,
-            );
-            cell_formatter.start_x = cursor.x;
-            cell_formatter.end_x = cursor.x;
-            cell_formatter.start_y = cursor.page_pin.y;
-            cell_formatter.end_y = cursor.page_pin.y;
-            try cell_formatter.format(writer);
         }
 
         // Emit current SGR style state
@@ -775,51 +931,7 @@ pub const ScreenFormatter = struct {
         }
 
         // Emit character set designations and invocations
-        if (self.extra.charsets) {
-            const charset = &self.screen.charset;
-
-            // Emit G0-G3 designations
-            for (std.enums.values(charsets.Slots)) |slot| {
-                const cs = charset.charsets.get(slot);
-                if (cs != .utf8) { // Only emit non-default charsets
-                    const intermediate: u8 = switch (slot) {
-                        .G0 => '(',
-                        .G1 => ')',
-                        .G2 => '*',
-                        .G3 => '+',
-                    };
-                    const final: u8 = switch (cs) {
-                        .ascii => 'B',
-                        .british => 'A',
-                        .dec_special => '0',
-                        else => continue,
-                    };
-                    try writer.print("\x1b{c}{c}", .{ intermediate, final });
-                }
-            }
-
-            // Emit GL invocation if not G0
-            if (charset.gl != .G0) {
-                const seq = switch (charset.gl) {
-                    .G0 => unreachable,
-                    .G1 => "\x0e", // SO - Shift Out
-                    .G2 => "\x1bn", // LS2
-                    .G3 => "\x1bo", // LS3
-                };
-                try writer.print("{s}", .{seq});
-            }
-
-            // Emit GR invocation if not G2
-            if (charset.gr != .G2) {
-                const seq = switch (charset.gr) {
-                    .G0 => unreachable, // GR can't be G0
-                    .G1 => "\x1b~", // LS1R
-                    .G2 => unreachable,
-                    .G3 => "\x1b|", // LS3R
-                };
-                try writer.print("{s}", .{seq});
-            }
-        }
+        if (self.extra.charsets) try writeCharsets(writer, &self.screen.charset);
 
         // If we have a pin_map, we need to count how many bytes the extras
         // will emit so we can map them all to the same pin. We do this by
@@ -839,6 +951,101 @@ pub const ScreenFormatter = struct {
                     self.screen.pages.getTopLeft(.screen),
                 std.math.cast(usize, discarding.count) orelse return error.WriteFailed,
             ) catch return error.WriteFailed;
+        }
+    }
+
+    /// Moves the cursor to x, y of the active area (relative to
+    /// cursor_origin, as CUP is in origin mode), with a pending wrap if it
+    /// has one. pin is the row's pin. CUP clears a pending wrap, so one at
+    /// the right edge is restored by reprinting the cell there, which uses
+    /// and changes the pen: callers restore the pen, and anything else that
+    /// printing uses, afterwards. A blank cell reprints as nothing, so a
+    /// wrap pending over one is not restored.
+    fn writeCursorPosition(
+        self: ScreenFormatter,
+        writer: *std.Io.Writer,
+        pin: Pin,
+        x: size.CellCountInt,
+        y: size.CellCountInt,
+        pending_wrap: bool,
+    ) std.Io.Writer.Error!void {
+        // A wrap is pending at the last column or, with left and right
+        // margins, at the right margin; either way printing the cell again
+        // leaves it pending, since the margins are set by now.
+        const origin = self.cursor_origin;
+        if (!pending_wrap) {
+            try writer.print("\x1b[{d};{d}H", .{ (y -| origin.y) + 1, (x -| origin.x) + 1 });
+            return;
+        }
+
+        // Pending wrap, we can't use CUP because it resets pending wrap.
+        const cell = pin.node.page().getRowAndCell(x, pin.y).cell;
+        const start_x = switch (cell.wide) {
+            .spacer_tail => x - 1,
+            .narrow, .wide, .spacer_head => x,
+        };
+
+        // Move cursor to the edge.
+        try writer.print(
+            "\x1b[{d};{d}H",
+            .{ (y -| origin.y) + 1, (start_x -| origin.x) + 1 },
+        );
+
+        // Reformat the cell which sets the proper pending wrap state.
+        var cell_formatter: PageFormatter = .init(pin.node.page(), self.opts);
+        cell_formatter.start_x = x;
+        cell_formatter.end_x = x;
+        cell_formatter.start_y = pin.y;
+        cell_formatter.end_y = pin.y;
+        try cell_formatter.format(writer);
+    }
+
+    /// Writes the designations (G0-G3) and invocations (GL, GR) of charset
+    /// that differ from the defaults.
+    fn writeCharsets(
+        writer: *std.Io.Writer,
+        charset: *const Screen.CharsetState,
+    ) std.Io.Writer.Error!void {
+        // Emit G0-G3 designations
+        for (std.enums.values(charsets.Slots)) |slot| {
+            const cs = charset.charsets.get(slot);
+            if (cs != .utf8) { // Only emit non-default charsets
+                const intermediate: u8 = switch (slot) {
+                    .G0 => '(',
+                    .G1 => ')',
+                    .G2 => '*',
+                    .G3 => '+',
+                };
+                const final: u8 = switch (cs) {
+                    .ascii => 'B',
+                    .british => 'A',
+                    .dec_special => '0',
+                    else => continue,
+                };
+                try writer.print("\x1b{c}{c}", .{ intermediate, final });
+            }
+        }
+
+        // Emit GL invocation if not G0
+        if (charset.gl != .G0) {
+            const seq = switch (charset.gl) {
+                .G0 => unreachable,
+                .G1 => "\x0e", // SO - Shift Out
+                .G2 => "\x1bn", // LS2
+                .G3 => "\x1bo", // LS3
+            };
+            try writer.print("{s}", .{seq});
+        }
+
+        // Emit GR invocation if not G2
+        if (charset.gr != .G2) {
+            const seq = switch (charset.gr) {
+                .G0 => unreachable, // GR can't be G0
+                .G1 => "\x1b~", // LS1R
+                .G2 => unreachable,
+                .G3 => "\x1b|", // LS3R
+            };
+            try writer.print("{s}", .{seq});
         }
     }
 };
@@ -923,6 +1130,23 @@ pub const PageListFormatter = struct {
             }
 
             page_state = try formatter.formatWithState(writer);
+        }
+
+        // VT output without trimming keeps the blank rows at the end: they
+        // are part of the screen's layout, and a replay without them puts
+        // the last rows of text at the bottom of the screen. The last row
+        // needs no newline after it.
+        if (self.opts.emit == .vt and !self.opts.trim) {
+            const state = page_state orelse return;
+            if (state.rows > 1) {
+                const count = state.rows - 1;
+                for (0..count) |_| try writer.writeAll("\r\n");
+                if (self.pin_map) |*m| m.map.append(
+                    m.alloc,
+                    m.map.getLastOrNull() orelse self.list.getTopLeft(.screen),
+                    count * 2,
+                ) catch return error.WriteFailed;
+            }
         }
     }
 };
@@ -1176,6 +1400,14 @@ pub const PageFormatter = struct {
         // when the hyperlink changes or ends.
         var current_hyperlink_id: ?hyperlink.Id = null;
 
+        // Whether the previous row's soft wrap was kept in VT output (see
+        // keep_wrap below), so this row continues it, blank cells included.
+        // Wraps are only kept within a page.
+        var kept_wrap = false;
+        // The style of the spacer head ending a kept wrap: replaying it
+        // prints the wide character that did not fit in that style.
+        var head_style: Style = .{};
+
         for (start_y..end_y + 1) |y_usize| {
             const y: size.CellCountInt = @intCast(y_usize);
             const row: *Row = self.page.getRow(y);
@@ -1215,13 +1447,41 @@ pub const PageFormatter = struct {
 
             // If this row is blank, accumulate to avoid a bunch of extra
             // work later. If it isn't blank, make sure we dump all our
-            // blanks.
-            if (!Cell.hasTextAny(cells_subset)) {
+            // blanks. For styled output a row whose cells only carry a
+            // background (erased while a background color was set) is
+            // not blank: dropping it would lose the color.
+            const row_blank = if (comptime formatStyled(emit))
+                !rowHasStyledContent(cells_subset)
+            else
+                !Cell.hasTextAny(cells_subset);
+            if (row_blank) {
+                if (comptime emit == .vt) {
+                    if (kept_wrap and row.wrap_continuation) try self.writeWrapLanding(
+                        emit,
+                        writer,
+                        null,
+                        &head_style,
+                        y,
+                        &style,
+                        &style_id,
+                        &current_hyperlink_id,
+                        &blank_cells,
+                    );
+                }
                 blank_rows += 1;
+                kept_wrap = false;
                 continue;
             }
 
             if (blank_rows > 0) {
+                // Line breaks are not part of any hyperlink either.
+                if (comptime emit == .vt) {
+                    if (current_hyperlink_id != null) {
+                        try self.formatHyperlinkClose(emit, writer);
+                        current_hyperlink_id = null;
+                    }
+                }
+
                 // Reset style before emitting newlines to prevent background
                 // colors from bleeding into the next line's leading cells.
                 if (!style.default()) {
@@ -1280,13 +1540,66 @@ pub const PageFormatter = struct {
                 blank_rows = 0;
             }
 
+            // VT output keeps a soft wrap even without unwrap: instead of
+            // a newline, the row's text runs on into the next row's, and
+            // the terminal replaying it wraps there itself, marking the row
+            // wrapped as the original was. That needs a next row on this
+            // page, in range, that continues this one and has something to
+            // wrap into it; otherwise the row ends with a newline as usual.
+            var next_head_style: Style = .{};
+            const keep_wrap = keep: {
+                if (comptime emit != .vt) break :keep false;
+                if (!row.wrap or self.rectangle or y >= end_y) break :keep false;
+
+                // Only printing into the last column leaves the wrap
+                // pending, so that cell must be text (or part of a wide
+                // character). A row whose tail was erased after it wrapped
+                // ends with a newline instead: its blank tail stays blank.
+                const last = &cells[self.page.size.cols - 1];
+                switch (last.wide) {
+                    .spacer_tail => {},
+                    // A wide character that did not fit left this; replaying
+                    // it wraps only if the next row still starts with one
+                    // (it may have been overwritten since).
+                    .spacer_head => {
+                        const next_first = &self.page.getCells(self.page.getRow(y + 1))[0];
+                        if (next_first.wide != .wide) break :keep false;
+                        next_head_style = self.cellStyle(last);
+                    },
+                    .narrow, .wide => if (!last.hasText()) break :keep false,
+                }
+
+                // The next row must continue this one; what replaying
+                // prints into it to make the terminal wrap is decided there
+                // (see writeWrapLanding).
+                const next_row: *Row = self.page.getRow(y + 1);
+                break :keep next_row.wrap_continuation;
+            };
+
             // If we're not wrapped, we always add a newline so after
             // the row is printed we can add a newline.
-            if (!row.wrap or !self.opts.unwrap) blank_rows += 1;
+            if (!row.wrap or !(self.opts.unwrap or keep_wrap)) blank_rows += 1;
 
             // If the row doesn't continue a wrap then we need to reset
             // our blank cell count.
-            if (!row.wrap_continuation or !self.opts.unwrap) blank_cells = 0;
+            if (!row.wrap_continuation or !(self.opts.unwrap or kept_wrap)) blank_cells = 0;
+
+            // A row continuing a kept wrap is entered by printing into it.
+            if (comptime emit == .vt) {
+                if (kept_wrap and row.wrap_continuation and row_start_x == 0) try self.writeWrapLanding(
+                    emit,
+                    writer,
+                    &cells_subset[0],
+                    &head_style,
+                    y,
+                    &style,
+                    &style_id,
+                    &current_hyperlink_id,
+                    &blank_cells,
+                );
+            }
+            kept_wrap = keep_wrap;
+            head_style = next_head_style;
 
             // Go through each cell and print it
             var cell_i: usize = 0;
@@ -1359,16 +1672,50 @@ pub const PageFormatter = struct {
                 }
 
                 // This cell is not blank. If we have accumulated blank cells
-                // then we want to emit them now.
+                // then we want to emit them now. Blank cells are unstyled, so
+                // for styled output the pen of the text before them must not
+                // paint them: reset it first.
                 if (blank_cells > 0) {
-                    try writer.splatByteAll(' ', blank_cells);
+                    // Blank cells are not part of any hyperlink.
+                    if (comptime emit == .vt) {
+                        if (current_hyperlink_id != null) {
+                            try self.formatHyperlinkClose(emit, writer);
+                            current_hyperlink_id = null;
+                        }
+                    }
+                    if (comptime formatStyled(emit)) {
+                        if (!style.default()) {
+                            try self.formatStyleClose(emit, writer);
+                            style = .{};
+                            style_id = 0;
+                        }
+                    }
 
-                    if (self.point_map) |*map| try self.appendBlankPoints(
-                        map,
-                        blank_cells,
-                        x,
-                        y,
-                    );
+                    // VT output steps over blank cells (CUF) rather than
+                    // writing spaces, which would turn them into text. (A
+                    // kept wrap always continues with text in the first
+                    // cell, so stepping never has to cross a row: blank
+                    // cells left at the end of a wrapped row lead up to a
+                    // wide character, which wraps from there.)
+                    if (comptime emit == .vt) {
+                        var buf: [32]u8 = undefined;
+                        const seq = std.fmt.bufPrint(&buf, "\x1b[{d}C", .{blank_cells}) catch unreachable;
+                        try writer.writeAll(seq);
+                        if (self.point_map) |*map| map.map.appendNTimes(
+                            map.alloc,
+                            .{ .x = x -| @as(size.CellCountInt, @intCast(@min(blank_cells, x))), .y = y },
+                            seq.len,
+                        ) catch return error.WriteFailed;
+                    } else {
+                        try writer.splatByteAll(' ', blank_cells);
+
+                        if (self.point_map) |*map| try self.appendBlankPoints(
+                            map,
+                            blank_cells,
+                            x,
+                            y,
+                        );
+                    }
 
                     blank_cells = 0;
                 }
@@ -1456,10 +1803,9 @@ pub const PageFormatter = struct {
 
                 // Hyperlink state
                 hyperlink: {
-                    // We currently only emit hyperlinks for HTML. In the
-                    // future we can support emitting OSC 8 hyperlinks for
-                    // VT output as well.
-                    if (comptime emit != .html) break :hyperlink;
+                    // Hyperlinks are emitted for HTML (anchors) and VT
+                    // (OSC 8).
+                    if (comptime emit == .plain) break :hyperlink;
 
                     // Get the hyperlink ID. This ID is our internal ID,
                     // not necessarily the OSC8 ID.
@@ -1484,17 +1830,20 @@ pub const PageFormatter = struct {
                     current_hyperlink_id = link_id;
 
                     // Emit the opening hyperlink tag
-                    const uri = uri: {
-                        const link = self.page.hyperlink_set.get(
-                            self.page.memory,
-                            link_id,
-                        );
-                        break :uri link.uri.offset.ptr(self.page.memory)[0..link.uri.len];
+                    const link = self.page.hyperlink_set.get(
+                        self.page.memory,
+                        link_id,
+                    );
+                    const uri = link.uri.offset.ptr(self.page.memory)[0..link.uri.len];
+                    const explicit_id: ?[]const u8 = switch (link.id) {
+                        .explicit => |id| id.offset.ptr(self.page.memory)[0..id.len],
+                        .implicit => null,
                     };
                     try self.formatHyperlinkOpen(
                         emit,
                         writer,
                         uri,
+                        explicit_id,
                     );
 
                     // If we have a point map, we map the hyperlink to
@@ -1505,6 +1854,7 @@ pub const PageFormatter = struct {
                             emit,
                             &discarding.writer,
                             uri,
+                            explicit_id,
                         );
                         map.map.appendNTimes(
                             map.alloc,
@@ -1539,9 +1889,37 @@ pub const PageFormatter = struct {
                         }
                     },
 
-                    // Cells with only background color (no text). Emit a space
-                    // with the appropriate background color SGR sequence.
+                    // Cells with only background color (no text).
                     .bg_color_palette, .bg_color_rgb => {
+                        // VT restores them as they are made: erasing with the
+                        // background set (ECH) leaves empty cells carrying
+                        // it, where a space would be text. The pen is already
+                        // the background, from the style block above. A run
+                        // of the same background is erased at once, then
+                        // stepped over (CUF).
+                        if (comptime emit == .vt) {
+                            var run: usize = 1;
+                            while (cell_i + run < cells_subset.len) : (run += 1) {
+                                const next = &cells_subset[cell_i + run];
+                                if (next.wide != .narrow or !sameBackground(cell, next)) break;
+                            }
+                            var buf: [32]u8 = undefined;
+                            const seq = std.fmt.bufPrint(
+                                &buf,
+                                "\x1b[{d}X\x1b[{d}C",
+                                .{ run, run },
+                            ) catch unreachable;
+                            try writer.writeAll(seq);
+                            if (self.point_map) |*map| map.map.appendNTimes(
+                                map.alloc,
+                                .{ .x = x, .y = y },
+                                seq.len,
+                            ) catch return error.WriteFailed;
+                            cell_i += run - 1;
+                            continue;
+                        }
+
+                        // Elsewhere a space with the background's style.
                         try writer.writeByte(' ');
                         if (self.point_map) |*map| map.map.append(
                             map.alloc,
@@ -1555,7 +1933,7 @@ pub const PageFormatter = struct {
         // If the style is non-default, we need to close our style tag.
         if (!style.default()) try self.formatStyleClose(emit, writer);
 
-        // Close any open hyperlink for HTML output
+        // Close any open hyperlink (HTML and VT output)
         if (current_hyperlink_id != null) try self.formatHyperlinkClose(emit, writer);
 
         // Close the monospace wrapper for HTML output
@@ -1605,6 +1983,111 @@ pub const PageFormatter = struct {
     // binary. track_points is a runtime bool for the same reason: a
     // comptime bool doubles the instantiation count for one predictable
     // branch per emitted cell.
+    /// Enters a row that continues a kept soft wrap (VT output). The
+    /// cursor waits at the previous row's right edge with a wrap pending,
+    /// and only printing moves it on, setting the previous row's wrap flag.
+    /// Text in the first cell without a background is simply printed next
+    /// and needs nothing here. Otherwise something is printed with the
+    /// default pen (the text, or a space for a blank first cell or row) so
+    /// that a wrap that scrolls the screen fills the new row with the
+    /// default background, then CR returns to the row's start, and a blank
+    /// cell is erased again (ECH, which clears this row's wrap state, not
+    /// the previous row's). The first cell is then written as usual.
+    fn writeWrapLanding(
+        self: *const PageFormatter,
+        comptime emit: Format,
+        writer: *std.Io.Writer,
+        first_: ?*const Cell,
+        head_style: *const Style,
+        y: size.CellCountInt,
+        style: *Style,
+        style_id: *u32,
+        current_hyperlink_id: *?hyperlink.Id,
+        blank_cells: *usize,
+    ) std.Io.Writer.Error!void {
+        const text = if (first_) |first|
+            first.hasText() and first.wide != .spacer_tail
+        else
+            false;
+        const head = !head_style.default();
+        if (text and !head) {
+            if (self.cellStyle(first_.?).bg_color == .none) return;
+        }
+
+        if (!style.default()) {
+            try self.formatStyleClose(emit, writer);
+            style.* = .{};
+            style_id.* = 0;
+        }
+        if (current_hyperlink_id.* != null) {
+            try self.formatHyperlinkClose(emit, writer);
+            current_hyperlink_id.* = null;
+        }
+
+        var discarding: std.Io.Writer.Discarding = .init(&.{});
+
+        // The row being wrapped can end in blank cells before a wide
+        // character's spacer head; step over them to where it wraps.
+        if (blank_cells.* > 0) {
+            var buf: [32]u8 = undefined;
+            const seq = std.fmt.bufPrint(&buf, "\x1b[{d}C", .{blank_cells.*}) catch unreachable;
+            try writer.writeAll(seq);
+            try discarding.writer.writeAll(seq);
+            blank_cells.* = 0;
+        }
+
+        if (text) {
+            const first = first_.?;
+            // A wide character that did not fit leaves a spacer head in
+            // the pen it was printed with, so it is printed in that one.
+            // Should the wrap scroll, the new row is filled with that
+            // pen's background; the rest of the row is erased with the
+            // default pen after it.
+            if (head) {
+                try self.formatStyleOpen(emit, writer, head_style);
+                try self.formatStyleOpen(emit, &discarding.writer, head_style);
+            }
+            switch (first.content_tag) {
+                inline .codepoint, .codepoint_grapheme => |tag| {
+                    try self.writeCell(tag, emit, writer, first);
+                    try self.writeCell(tag, emit, &discarding.writer, first);
+                },
+                .bg_color_palette, .bg_color_rgb => unreachable,
+            }
+            const tail = if (head) "\x1b[0m\x1b[K\r" else "\r";
+            try writer.writeAll(tail);
+            try discarding.writer.writeAll(tail);
+        } else {
+            try writer.writeAll(" \r\x1b[X");
+            try discarding.writer.writeAll(" \r\x1b[X");
+        }
+        if (self.point_map) |*map| map.map.appendNTimes(
+            map.alloc,
+            .{ .x = 0, .y = y },
+            std.math.cast(usize, discarding.count) orelse return error.WriteFailed,
+        ) catch return error.WriteFailed;
+    }
+
+    /// Whether two background-only cells carry the same background.
+    fn sameBackground(a: *const Cell, b: *const Cell) bool {
+        if (a.content_tag != b.content_tag) return false;
+        return switch (a.content_tag) {
+            .bg_color_palette => a.content.color_palette.data == b.content.color_palette.data,
+            .bg_color_rgb => std.meta.eql(a.content.color_rgb, b.content.color_rgb),
+            .codepoint, .codepoint_grapheme => false,
+        };
+    }
+
+    /// Whether a row has anything styled output must write: text, or a
+    /// cell carrying styling such as a background color. Matches the
+    /// per-cell blank test of the styled formats.
+    fn rowHasStyledContent(cells: []const Cell) bool {
+        for (cells) |*cell| {
+            if (!cell.isEmpty() or cell.hasStyling()) return true;
+        }
+        return false;
+    }
+
     noinline fn writeCellRun(
         self: *const PageFormatter,
         comptime emit: Format,
@@ -1679,7 +2162,7 @@ pub const PageFormatter = struct {
             // cell must belong to the currently open hyperlink (or none).
             // Transitions take the slow path. This is checked after blank
             // accounting because blank cells never touch hyperlink state.
-            if (comptime emit == .html) {
+            if (comptime formatStyled(emit)) {
                 if (cell.hyperlink) {
                     const run_id = run_hyperlink_id orelse break;
                     const cell_id = self.page.lookupHyperlink(cell) orelse break;
@@ -1691,6 +2174,16 @@ pub const PageFormatter = struct {
             const x: size.CellCountInt = @intCast(run_x + i);
 
             // This cell produces output: materialize accumulated blanks.
+            // Blanks are unstyled, so under any other pen the slow path
+            // writes them, resetting the pen first.
+            if (comptime formatStyled(emit)) {
+                if (pending > 0 and run_style_id != 0) break;
+            }
+            // VT output steps over blanks rather than printing them, which
+            // the slow path does.
+            if (comptime emit == .vt) {
+                if (pending > 0) break;
+            }
             if (pending > 0) {
                 if (track_points) try self.appendBlankPoints(
                     &self.point_map.?,
@@ -2078,9 +2571,18 @@ pub const PageFormatter = struct {
         comptime emit: Format,
         writer: *std.Io.Writer,
         uri: []const u8,
+        explicit_id: ?[]const u8,
     ) std.Io.Writer.Error!void {
         switch (emit) {
-            .plain, .vt => unreachable,
+            .plain => unreachable,
+
+            // OSC 8, with the id the program gave the link, if any, so cells
+            // of one link stay one link.
+            .vt => if (explicit_id) |id| {
+                try writer.print("\x1b]8;id={s};{s}\x1b\\", .{ id, uri });
+            } else {
+                try writer.print("\x1b]8;;{s}\x1b\\", .{uri});
+            },
 
             // layout since we're primarily using it as a CSS wrapper.
             .html => {
@@ -2102,7 +2604,8 @@ pub const PageFormatter = struct {
     ) std.Io.Writer.Error!void {
         const str: []const u8 = switch (emit) {
             .html => "</a>",
-            .plain, .vt => return,
+            .vt => "\x1b]8;;\x1b\\",
+            .plain => return,
         };
 
         try writer.writeAll(str);
@@ -4143,6 +4646,507 @@ test "Page VT duplicate style not emitted twice" {
     try testing.expectEqual(output.len, point_map.items.len);
 }
 
+/// Formats the active page of t as VT and replays it into a fresh terminal
+/// of the same size, for round-trip tests. The caller deinits the result.
+fn testReplayPageVt(t: *Terminal) !Terminal {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+    const page = t.screens.active.pages.pages.last.?.page();
+    var formatter: PageFormatter = .init(page, .vt);
+    try formatter.format(&builder.writer);
+
+    var t2 = try Terminal.init(testing.io, alloc, .{ .cols = t.cols, .rows = t.rows });
+    errdefer t2.deinit(alloc);
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(builder.writer.buffered());
+    return t2;
+}
+
+test "Page VT keeps rows that only have a background" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 6 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Erasing the screen with a background color set paints every cell.
+    s.nextSlice("\x1b[44m\x1b[2J\x1b[Hblue\x1b[0m");
+
+    var t2 = try testReplayPageVt(&t);
+    defer t2.deinit(alloc);
+
+    // A row of nothing but background, and the rest of the text's row.
+    for ([_][2]u16{ .{ 0, 4 }, .{ 10, 0 } }) |pt| {
+        const cell = t2.screens.active.pages.getCell(.{
+            .screen = .{ .x = pt[0], .y = pt[1] },
+        }).?.cell;
+        try testing.expectEqual(.bg_color_palette, cell.content_tag);
+        try testing.expectEqual(4, cell.content.color_palette.data);
+    }
+}
+
+test "Page VT does not paint a gap with the pen of the text before it" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The gap between the two words was never written.
+    s.nextSlice("\x1b[41mred\x1b[0m\x1b[10Gplain");
+
+    var t2 = try testReplayPageVt(&t);
+    defer t2.deinit(alloc);
+
+    for (3..9) |x| {
+        const cell = t2.screens.active.pages.getCell(.{
+            .screen = .{ .x = @intCast(x), .y = 0 },
+        }).?.cell;
+        try testing.expectEqual(.codepoint, cell.content_tag);
+        try testing.expectEqual(0, cell.style_id);
+    }
+    // The text after the gap is where it was.
+    try testing.expectEqual('p', t2.screens.active.pages.getCell(.{
+        .screen = .{ .x = 9, .y = 0 },
+    }).?.cell.codepoint());
+}
+
+/// The URI of the hyperlink on the cell at x, y of t's screen, if any.
+fn testHyperlinkUri(t: *Terminal, x: u16, y: u16) ?[]const u8 {
+    const c = t.screens.active.pages.getCell(.{ .screen = .{ .x = x, .y = y } }).?;
+    if (!c.cell.hyperlink) return null;
+    const page = c.node.page();
+    const id = page.lookupHyperlink(c.cell) orelse return null;
+    const link = page.hyperlink_set.get(page.memory, id);
+    return link.uri.offset.ptr(page.memory)[0..link.uri.len];
+}
+
+test "Page VT keeps hyperlinks" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 40, .rows = 4 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    s.nextSlice("\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ after");
+    s.nextSlice("\r\n\x1b]8;id=x;https://example.org\x1b\\one\x1b]8;;\x1b\\");
+
+    var t2 = try testReplayPageVt(&t);
+    defer t2.deinit(alloc);
+
+    for (0..4) |x| try testing.expectEqualStrings(
+        "https://example.com",
+        testHyperlinkUri(&t2, @intCast(x), 0).?,
+    );
+    // The space and the text after the link are not part of it.
+    try testing.expect(testHyperlinkUri(&t2, 4, 0) == null);
+    try testing.expect(testHyperlinkUri(&t2, 5, 0) == null);
+    try testing.expectEqualStrings("https://example.org", testHyperlinkUri(&t2, 0, 1).?);
+
+    // An explicit id is kept.
+    const c = t2.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?;
+    const page = c.node.page();
+    const link = page.hyperlink_set.get(page.memory, page.lookupHyperlink(c.cell).?);
+    try testing.expectEqualStrings("x", link.id.explicit.offset.ptr(page.memory)[0..link.id.explicit.len]);
+}
+
+/// Checks that t2's rows have t's soft wraps and the same text.
+fn testExpectSameWraps(t: *Terminal, t2: *Terminal) !void {
+    const testing = std.testing;
+    for (0..t.rows) |y| {
+        const a = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = @intCast(y) } }).?;
+        const b = t2.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = @intCast(y) } }).?;
+        try testing.expectEqual(a.row.wrap, b.row.wrap);
+        try testing.expectEqual(a.row.wrap_continuation, b.row.wrap_continuation);
+        for (0..t.cols) |x| {
+            const ca = t.screens.active.pages.getCell(.{ .screen = .{ .x = @intCast(x), .y = @intCast(y) } }).?.cell;
+            const cb = t2.screens.active.pages.getCell(.{ .screen = .{ .x = @intCast(x), .y = @intCast(y) } }).?.cell;
+            try testing.expectEqual(ca.codepoint(), cb.codepoint());
+            try testing.expectEqual(ca.wide, cb.wide);
+        }
+    }
+}
+
+test "Page VT keeps soft wraps" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // One line over three rows, then a line of its own.
+    s.nextSlice("wrapwrapwrapwrapwrapwrapwrapwrapwrapwrapwrapwrap\r\nnext");
+
+    var t2 = try testReplayPageVt(&t);
+    defer t2.deinit(alloc);
+    try testExpectSameWraps(&t, &t2);
+}
+
+test "Page VT keeps a wrap where a wide character did not fit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The wide character leaves a spacer head in the last column.
+    s.nextSlice("abcdefghi\u{5371}x");
+
+    var t2 = try testReplayPageVt(&t);
+    defer t2.deinit(alloc);
+    try testExpectSameWraps(&t, &t2);
+}
+
+test "Page VT keeps a wrapped row followed by a blank one" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // A row that wrapped onto one that was then erased, and text after it.
+    s.nextSlice("0123456789ab\x1b[2K\r\nnext");
+
+    var t2 = try testReplayPageVt(&t);
+    defer t2.deinit(alloc);
+    try testExpectSameWraps(&t, &t2);
+    for (0..t.rows) |y| {
+        for (0..t.cols) |x| {
+            const pt: @import("point.zig").Point = .{ .screen = .{ .x = @intCast(x), .y = @intCast(y) } };
+            try testing.expectEqual(
+                t.screens.active.pages.getCell(pt).?.cell.codepoint(),
+                t2.screens.active.pages.getCell(pt).?.cell.codepoint(),
+            );
+        }
+    }
+}
+
+test "Page VT does not keep a wrap that the next row does not continue" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Inserting a line between a wrapped row and its continuation leaves a
+    // wrapped row followed by one that does not continue it.
+    s.nextSlice("0123456789ab\x1b[2;1H\x1b[L\x1b[2;1Hmid");
+
+    var t2 = try testReplayPageVt(&t);
+    defer t2.deinit(alloc);
+    for (0..t.rows) |y| {
+        for (0..t.cols) |x| {
+            const pt: @import("point.zig").Point = .{ .screen = .{ .x = @intCast(x), .y = @intCast(y) } };
+            try testing.expectEqual(
+                t.screens.active.pages.getCell(pt).?.cell.codepoint(),
+                t2.screens.active.pages.getCell(pt).?.cell.codepoint(),
+            );
+        }
+    }
+}
+
+test "Page VT keeps the blank tail of a wrapped row blank" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 4 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The row wrapped, then its end was erased: the wrap cannot be replayed
+    // without writing to those cells, so they must stay empty instead.
+    s.nextSlice("0123456789ab\x1b[1;6H\x1b[K");
+
+    var t2 = try testReplayPageVt(&t);
+    defer t2.deinit(alloc);
+    for (5..10) |x| {
+        const cell = t2.screens.active.pages.getCell(.{ .screen = .{ .x = @intCast(x), .y = 0 } }).?.cell;
+        try testing.expect(!cell.hasText());
+    }
+    try testing.expectEqual('a', t2.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?.cell.codepoint());
+}
+
+test "Terminal vt enters the alternate screen before setting other modes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 4 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Entering with 1049 saved the cursor with origin mode off.
+    s.nextSlice("\x1b[?1049h\x1b[?6hx");
+
+    var t2 = try testReplayTerminalVt(&t);
+    defer t2.deinit(alloc);
+    try testing.expect(t2.modes.get(.origin));
+
+    // Leaving restores the saved cursor, origin mode off, in both.
+    var s1 = t.vtStream();
+    defer s1.deinit();
+    s1.nextSlice("\x1b[?1049l");
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice("\x1b[?1049l");
+    try testing.expect(!t.modes.get(.origin));
+    try testing.expect(!t2.modes.get(.origin));
+}
+
+test "Terminal vt keeps an alternate screen mode left set on the primary screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 4 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Leaving with 47 keeps 1047 set.
+    s.nextSlice("primary\x1b[?1047h\x1b[?47l");
+    try testing.expectEqual(.primary, t.screens.active_key);
+    try testing.expect(t.modes.get(.alt_screen));
+
+    var t2 = try testReplayTerminalVt(&t);
+    defer t2.deinit(alloc);
+    try testing.expectEqual(.primary, t2.screens.active_key);
+    try testing.expect(t2.modes.get(.alt_screen));
+    try testing.expect(!t2.modes.get(.alt_screen_legacy));
+
+    const str = try t2.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings("primary", str);
+}
+
+test "Page VT keeps the style of a wide character's spacer head" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 2 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The wide character does not fit, leaving a spacer head with a
+    // background, and wraps at the bottom, scrolling.
+    s.nextSlice("\r\n012345678\x1b[44m\u{754C}\x1b[0mx");
+
+    var t2 = try testReplayPageVt(&t);
+    defer t2.deinit(alloc);
+    try testExpectSameWraps(&t, &t2);
+    const head = t2.screens.active.pages.getCell(.{ .screen = .{ .x = 9, .y = 1 } }).?;
+    try testing.expectEqual(.spacer_head, head.cell.wide);
+    try testing.expect(head.style().bg_color != .none);
+    // The rest of the new row has no background.
+    const cell = t2.screens.active.pages.getCell(.{ .screen = .{ .x = 5, .y = 2 } }).?.cell;
+    try testing.expectEqual(0, cell.style_id);
+}
+
+test "Terminal vt restores a wrap pending at the right margin" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    s.nextSlice("\x1b[?69h\x1b[1;3sabc");
+    try testing.expect(t.screens.active.cursor.pending_wrap);
+
+    var t2 = try testReplayTerminalVt(&t);
+    defer t2.deinit(alloc);
+    try testing.expect(t2.screens.active.cursor.pending_wrap);
+    try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+    try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+}
+
+test "Terminal vt restores a saved wrap pending at the right margin" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    s.nextSlice("\x1b[?69h\x1b[1;3sabc\x1b7\x1b[3;1H");
+
+    var t2 = try testReplayTerminalVt(&t);
+    defer t2.deinit(alloc);
+    var s1 = t.vtStream();
+    defer s1.deinit();
+    s1.nextSlice("\x1b8");
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice("\x1b8");
+    try testing.expect(t.screens.active.cursor.pending_wrap);
+    try testing.expect(t2.screens.active.cursor.pending_wrap);
+    try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+}
+
+test "Page VT keeps a wide character wrapping from a blank row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The row is blank up to the spacer head the bold wide character
+    // left when it wrapped.
+    s.nextSlice("012345678\x1b[B\x1b[1m\u{754C}0");
+
+    var t2 = try testReplayPageVt(&t);
+    defer t2.deinit(alloc);
+    try testExpectSameWraps(&t, &t2);
+    const want = try t.plainString(alloc);
+    defer alloc.free(want);
+    const got = try t2.plainString(alloc);
+    defer alloc.free(got);
+    try testing.expectEqualStrings(want, got);
+    const head = t2.screens.active.pages.getCell(.{ .screen = .{ .x = 9, .y = 1 } }).?;
+    try testing.expectEqual(.spacer_head, head.cell.wide);
+    try testing.expect(head.style().flags.bold);
+}
+
+test "Page VT keeps a wrap into text with a background at the bottom" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 2 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The wrap scrolls the screen while the pen has no background; the
+    // first cell of the new row gets one afterwards.
+    s.nextSlice("\r\n0123456789a\r\x1b[44ma\x1b[0m");
+
+    var t2 = try testReplayPageVt(&t);
+    defer t2.deinit(alloc);
+    try testExpectSameWraps(&t, &t2);
+    // The rest of the new row has no background.
+    const cell = t2.screens.active.pages.getCell(.{ .screen = .{ .x = 5, .y = 2 } }).?.cell;
+    try testing.expectEqual(.codepoint, cell.content_tag);
+    try testing.expectEqual(0, cell.style_id);
+}
+
+test "Page VT does not keep a wrap whose wide character was overwritten" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The wide character that did not fit is then overwritten by a narrow
+    // one, which on its own would fit in the spacer's column.
+    s.nextSlice("abcdefghi\u{5371}x\x1b[2;1Hy");
+
+    var t2 = try testReplayPageVt(&t);
+    defer t2.deinit(alloc);
+    for (0..t.rows) |y| {
+        for (0..t.cols) |x| {
+            const pt: @import("point.zig").Point = .{ .screen = .{ .x = @intCast(x), .y = @intCast(y) } };
+            try testing.expectEqual(
+                t.screens.active.pages.getCell(pt).?.cell.codepoint(),
+                t2.screens.active.pages.getCell(pt).?.cell.codepoint(),
+            );
+        }
+    }
+}
+
+test "Terminal vt writes the contents before insert mode" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // A wrap into text with a background is replayed by writing the first
+    // cell twice, which insert mode would turn into an insertion.
+    s.nextSlice("\x1b[4h0123456789\x1b[44mab\x1b[0m");
+
+    var t2 = try testReplayTerminalVt(&t);
+    defer t2.deinit(alloc);
+    try testExpectSameWraps(&t, &t2);
+    try testing.expect(t2.modes.get(.insert));
+}
+
+test "Terminal vt keeps soft wraps with autowrap off" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 4 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    s.nextSlice("wrapwrapwrapwrapwrapwrap\x1b[?7l");
+
+    var t2 = try testReplayTerminalVt(&t);
+    defer t2.deinit(alloc);
+    try testExpectSameWraps(&t, &t2);
+    try testing.expect(!t2.modes.get(.wraparound));
+}
+
+test "PageList VT without trim keeps trailing blank rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("one\r\ntwo");
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+    var pin_map: PinMap.Map = .empty;
+    defer pin_map.deinit(alloc);
+    var opts: Options = .vt;
+    opts.trim = false;
+    var formatter: PageListFormatter = .init(&t.screens.active.pages, opts);
+    formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    // Six rows: two of text and four blank, so five line breaks.
+    try testing.expectEqualStrings("one\r\ntwo\r\n\r\n\r\n\r\n", output);
+    try testing.expectEqual(output.len, pin_map.count());
+
+    // Trimmed output still drops them.
+    var trimmed: std.Io.Writer.Allocating = .init(alloc);
+    defer trimmed.deinit();
+    var trimming: PageListFormatter = .init(&t.screens.active.pages, .vt);
+    try trimming.format(&trimmed.writer);
+    try testing.expectEqualStrings("one\r\ntwo", trimmed.writer.buffered());
+}
+
 test "PageList plain single line" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -5754,6 +6758,101 @@ test "Terminal vt with tabstops" {
 
     // Verify the reordered terminal state is still represented in the map.
     try testing.expectEqual(output.len, pin_map.count());
+}
+
+/// Formats t as VT with every extra and replays it into a fresh terminal of
+/// the same size. The caller deinits the result.
+fn testReplayTerminalVt(t: *Terminal) !Terminal {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+    var formatter: TerminalFormatter = .init(t, .vt);
+    formatter.extra = .all;
+    try formatter.format(&builder.writer);
+
+    var t2 = try Terminal.init(testing.io, alloc, .{ .cols = t.cols, .rows = t.rows });
+    errdefer t2.deinit(alloc);
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(builder.writer.buffered());
+    return t2;
+}
+
+test "Terminal vt cursor in origin mode" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 40, .rows = 24 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // In origin mode CUP counts from the top margin.
+    s.nextSlice("\x1b[5;20r\x1b[?6h\x1b[3;3Hx");
+
+    var t2 = try testReplayTerminalVt(&t);
+    defer t2.deinit(alloc);
+
+    try testing.expect(t2.modes.get(.origin));
+    try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+    try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+}
+
+test "Terminal vt saved cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 40, .rows = 24 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Save a cursor with a position, a pen, a charset and origin mode,
+    // then move on with other state.
+    s.nextSlice("\x1b[3;10r\x1b[?6h\x1b[2;7H\x1b[1;31m\x1b(0\x1b7");
+    s.nextSlice("\x1b[?6l\x1b[r\x1b[0m\x1b(B\x1b[20;1Hcurrent");
+
+    // Every byte, the saved cursor's included, is in the pin map.
+    {
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+        var pin_map: PinMap.Map = .empty;
+        defer pin_map.deinit(alloc);
+        var formatter: TerminalFormatter = .init(&t, .vt);
+        formatter.extra = .all;
+        formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
+        try formatter.format(&builder.writer);
+        try testing.expectEqual(builder.writer.buffered().len, pin_map.count());
+    }
+
+    {
+        var replayed = try testReplayTerminalVt(&t);
+        defer replayed.deinit(alloc);
+
+        // The current state is untouched by the saved one...
+        try testing.expectEqual(t.screens.active.cursor.x, replayed.screens.active.cursor.x);
+        try testing.expectEqual(t.screens.active.cursor.y, replayed.screens.active.cursor.y);
+        try testing.expect(!replayed.modes.get(.origin));
+        try testing.expect(replayed.screens.active.cursor.style.default());
+
+        // ...and restoring the saved cursor gives back what was saved.
+        var sr = replayed.vtStream();
+        defer sr.deinit();
+        sr.nextSlice("\x1b8");
+        var so = t.vtStream();
+        defer so.deinit();
+        so.nextSlice("\x1b8");
+        try testing.expectEqual(t.screens.active.cursor.x, replayed.screens.active.cursor.x);
+        try testing.expectEqual(t.screens.active.cursor.y, replayed.screens.active.cursor.y);
+        try testing.expect(replayed.modes.get(.origin));
+        try testing.expect(replayed.screens.active.cursor.style.eql(t.screens.active.cursor.style));
+        try testing.expectEqual(
+            t.screens.active.charset.charsets.get(.G0),
+            replayed.screens.active.charset.charsets.get(.G0),
+        );
+    }
 }
 
 test "Terminal vt with keyboard modes" {
